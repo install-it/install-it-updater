@@ -54,10 +54,10 @@ class Updater:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if exc_type:
-            self.restore()
-        else:
-            self.cleanup()
+        # if exc_type:
+        #     self.restore()
+        # else:
+        #     self.cleanup()
         return False
 
     def backup(self):
@@ -188,8 +188,9 @@ if __name__ == '__main__':
             updater.update()
 
         print('✔ Update successful.')
-        if input('Open the app? [Y]/N: ').lower() in ('y', ''):
-            subprocess.Popen('install-it.exe')
     except Exception as e:
         print(f'✘ Update failed: {e}')
         input('Press any key to exit...')
+
+    if input('Open the app? [Y]/N: ').lower() in ('y', ''):
+        subprocess.Popen('install-it.exe')
