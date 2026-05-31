@@ -157,50 +157,112 @@ class Updater:
                 shutil.rmtree('conf', ignore_errors=True)
             shutil.move(str(backup_conf), 'conf')
             
-        # ONE-TIME ONE-WAY SQLITE MIGRATION HACK
-        # Converts legacy conf/groups.json directly into conf/data.db before Go boots up
         conf_dir = Path('conf')
         json_path = conf_dir / 'groups.json'
         db_path = conf_dir / 'data.db'
 
         if json_path.exists():
-            print('  ↳ Found legacy groups.json. Migrating data to SQLite data.db...')
+            print('  ↳ Found legacy groups.json. Migrating data to SQLite database layout...')
             try:
                 conn = sqlite3.connect(str(db_path))
                 cursor = conn.cursor()
                 
-                # Pre-initialize table layout in case Go migrations haven't initialized yet
+                # 1. Enforce precise base table layouts if the Go app hasn't initialized yet
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS driver_groups (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        type TEXT NOT NULL,
-                        description TEXT
+                        name TEXT,
+                        type TEXT,
+                        mutually_exclusive NUMERIC,
+                        position INTEGER
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS drivers (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id INTEGER,
+                        name TEXT,
+                        type TEXT,
+                        path TEXT,
+                        flags TEXT,
+                        min_exe_time REAL,
+                        allow_rt_codes TEXT,
+                        FOREIGN KEY(group_id) REFERENCES driver_groups(id) ON DELETE CASCADE
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS driver_incompatibles (
+                        driver_id INTEGER,
+                        incompatible_driver_id INTEGER,
+                        PRIMARY KEY (driver_id, incompatible_driver_id)
                     )
                 ''')
                 
+                # Wipe any partial records to prevent key collision crashes
+                cursor.execute("DELETE FROM driver_incompatibles;")
+                cursor.execute("DELETE FROM drivers;")
+                cursor.execute("DELETE FROM driver_groups;")
+                conn.commit()
+
                 with open(json_path, 'r', encoding='utf-8') as f:
                     legacy_groups = json.load(f)
                     
-                for group in legacy_groups:
-                    name = group.get('name', '')
+                # Dict tables to trace relationships across the new incremental integer spectrum
+                old_driver_to_new_int = {}
+                incompatible_linking_queue = []
+
+                # 2. Iterate and transform legacy structured JSON configurations
+                for pos, group in enumerate(legacy_groups):
+                    g_name = group.get('name', '')
                     g_type = group.get('type', '')
-                    desc = group.get('description', '')
-                    
-                    # Prevent duplication collisions
-                    cursor.execute('SELECT 1 FROM driver_groups WHERE name = ? AND type = ?', (name, g_type))
-                    if not cursor.fetchone():
+                    mutually_exclusive = 1 if g_type == 'display' else 0
+
+                    cursor.execute(
+                        'INSERT INTO driver_groups (name, type, mutually_exclusive, position) VALUES (?, ?, ?, ?)',
+                        (g_name, g_type, mutually_exclusive, pos)
+                    )
+                    new_group_id = cursor.lastrowid
+
+                    for driver in group.get('drivers', []):
+                        old_driver_id = driver.get('id')
+                        d_name = driver.get('name', '')
+                        d_type = driver.get('type', '')
+                        d_path = driver.get('path', '')
+                        
+                        # Pack array primitives into valid structural JSON strings for the Go parser
+                        d_flags = json.dumps(driver.get('flags', []))
+                        d_rt_codes = json.dumps(driver.get('allowRtCodes', []))
+                        d_min_time = float(driver.get('minExeTime', 5))
+
                         cursor.execute(
-                            'INSERT INTO driver_groups (name, type, description) VALUES (?, ?, ?)',
-                            (name, g_type, desc)
+                            '''INSERT INTO drivers 
+                               (group_id, name, type, path, flags, min_exe_time, allow_rt_codes) 
+                               VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                            (new_group_id, d_name, d_type, d_path, d_flags, d_min_time, d_rt_codes)
                         )
-                
+                        new_driver_id = cursor.lastrowid
+
+                        # Map the old temporary string ID to the clean autoincremented SQLite ID
+                        old_driver_to_new_int[old_driver_id] = new_driver_id
+                        
+                        for inc_id in driver.get('incompatibles', []):
+                            incompatible_linking_queue.append((new_driver_id, inc_id))
+
+                # 3. Resolve the dependency relationships using our temporary map
+                for current_id, target_old_id in incompatible_linking_queue:
+                    mapped_target_id = old_driver_to_new_int.get(target_old_id)
+                    if mapped_target_id:
+                        cursor.execute(
+                            'INSERT OR IGNORE INTO driver_incompatibles (driver_id, incompatible_driver_id) VALUES (?, ?)',
+                            (current_id, mapped_target_id)
+                        )
+
                 conn.commit()
                 conn.close()
                 
-                # De-activate migration file safely via appending .bak suffix
+                # Turn groups.json into groups.json.bak so this migration runs exactly once
                 json_path.rename(json_path.with_suffix('.json.bak'))
-                print('  ↳ Migration complete! groups.json converted to groups.json.bak')
+                print('  ↳ Migration complete! groups.json cleanly converted into SQLite database fields.')
             except Exception as e:
                 print(f'  ⚠ Migration warning: Failed to convert legacy database assets: {e}')
 
