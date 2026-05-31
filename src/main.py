@@ -1,8 +1,10 @@
 import argparse
 import contextlib
+import json
 import os
 import random
 import shutil
+import sqlite3
 import string
 import subprocess
 import tempfile
@@ -67,8 +69,6 @@ class Updater:
             shutil.rmtree(self.dir_backup)
         self.dir_backup.mkdir()
 
-        # Isolate and back up only the core executable and the configuration files.
-        # Leave 'drivers/' completely untouched in the application root directory.
         for filename in ('install-it.exe', 'conf'):
             path = Path(filename)
             if not path.exists():
@@ -99,7 +99,6 @@ class Updater:
     def replace_executable(self):
         print('▶ Downloading updates from GitHub releases...')
 
-        # DYNAMIC ASSET RESOLUTION: Resolve asset naming targets based on major version boundaries
         if self.version_to.major >= 2:
             filename = f'install-it.{self.binary_type}-bundled.zip' if self.webview else f'install-it.{self.binary_type}.zip'
         else:
@@ -129,27 +128,22 @@ class Updater:
 
             print('  ↳ Deploying new files...')
             
-            # CONDITIONALLY CLEAN LEGACY DIRECTORY MUTATIONS: 
-            # If transitioning to v2+, purge the obsolete root level 'bin' directory to clear disk space.
             if self.version_to.major >= 2 and Path('bin').exists():
                 shutil.rmtree('bin', ignore_errors=True)
 
-            # Enumerate the items dynamically generated inside the unpacked temporary directory workspace
             for item in tmpdir.iterdir():
                 if item.name == filename:
-                    continue  # Skip processing the source zip file itself
+                    continue
                 
                 dest_path = Path(item.name)
-                time.sleep(0.5)  # Add brief safety wait time to prevent transient Windows locking glitches
+                time.sleep(0.5)
                 
                 if item.is_dir():
-                    # Only deploy 'internals' if it exists in the incoming payload (Bundled version option)
                     if item.name == 'internals':
                         if dest_path.exists():
                             shutil.rmtree(dest_path, True)
                         shutil.move(str(item), str(dest_path))
                 else:
-                    # Overwrite core executables or root-level files in-place
                     if dest_path.exists():
                         dest_path.unlink()
                     shutil.move(str(item), str(dest_path))
@@ -157,19 +151,58 @@ class Updater:
     def restore_and_migrate_config(self):
         print('▶ Restoring configuration profiles...')
         
-        # Pull your 'conf' folder out of safety backup storage and drop it back into the root folder
         backup_conf = self.dir_backup.joinpath('conf')
         if backup_conf.exists():
             if Path('conf').exists():
                 shutil.rmtree('conf', ignore_errors=True)
             shutil.move(str(backup_conf), 'conf')
             
-        if self.version_from.major == self.version_to.major:
-            return
-            
-        if self.version_from.major == 1 and self.version_to.major >= 2:
-            print('  ↳ Legacy configuration boundary crossed. Native SQLite migration targets handed off to Go backend.')
-            return
+        # ONE-TIME ONE-WAY SQLITE MIGRATION HACK
+        # Converts legacy conf/groups.json directly into conf/data.db before Go boots up
+        conf_dir = Path('conf')
+        json_path = conf_dir / 'groups.json'
+        db_path = conf_dir / 'data.db'
+
+        if json_path.exists():
+            print('  ↳ Found legacy groups.json. Migrating data to SQLite data.db...')
+            try:
+                conn = sqlite3.connect(str(db_path))
+                cursor = conn.cursor()
+                
+                # Pre-initialize table layout in case Go migrations haven't initialized yet
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS driver_groups (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        description TEXT
+                    )
+                ''')
+                
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    legacy_groups = json.load(f)
+                    
+                for group in legacy_groups:
+                    name = group.get('name', '')
+                    g_type = group.get('type', '')
+                    desc = group.get('description', '')
+                    
+                    # Prevent duplication collisions
+                    cursor.execute('SELECT 1 FROM driver_groups WHERE name = ? AND type = ?', (name, g_type))
+                    if not cursor.fetchone():
+                        cursor.execute(
+                            'INSERT INTO driver_groups (name, type, description) VALUES (?, ?, ?)',
+                            (name, g_type, desc)
+                        )
+                
+                conn.commit()
+                conn.close()
+                
+                # De-activate migration file safely via appending .bak suffix
+                json_path.rename(json_path.with_suffix('.json.bak'))
+                print('  ↳ Migration complete! groups.json converted to groups.json.bak')
+            except Exception as e:
+                print(f'  ⚠ Migration warning: Failed to convert legacy database assets: {e}')
 
     def update(self) -> None:
         self.print_summary()
@@ -216,7 +249,5 @@ if __name__ == '__main__':
         exit(1)
 
     if input('Launch updated application now? [Y]/N: ').lower() in ('y', ''):
-        # TRUE DETACHED PROCESS HANDOFF: Spawn the new Go executable with creation flags 
-        # that fully detach it from the Python script context to prevent Windows file handle sharing locks.
         DETACHED_PROCESS = 0x00000008
         subprocess.Popen(['install-it.exe'], creationflags=DETACHED_PROCESS, close_fds=True)
