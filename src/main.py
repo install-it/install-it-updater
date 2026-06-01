@@ -167,7 +167,12 @@ class Updater:
                 conn = sqlite3.connect(str(db_path))
                 cursor = conn.cursor()
                 
-                # 1. Enforce precise base table layouts if the Go app hasn't initialized yet
+                # 1. Reconstruct the absolute final, post-migration schema matching the Go environment
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS migrations (
+                        id TEXT PRIMARY KEY
+                    )
+                ''')
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS driver_groups (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,18 +192,41 @@ class Updater:
                         flags TEXT,
                         min_exe_time REAL,
                         allow_rt_codes TEXT,
-                        FOREIGN KEY(group_id) REFERENCES driver_groups(id) ON DELETE CASCADE
+                        CONSTRAINT fk_driver_groups_drivers FOREIGN KEY (group_id) REFERENCES driver_groups(id) ON DELETE CASCADE
                     )
                 ''')
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS driver_incompatibles (
                         driver_id INTEGER,
                         incompatible_driver_id INTEGER,
-                        PRIMARY KEY (driver_id, incompatible_driver_id)
+                        PRIMARY KEY (driver_id, incompatible_driver_id),
+                        CONSTRAINT fk_driver_incompatibles_driver FOREIGN KEY (driver_id) REFERENCES drivers(id) ON DELETE CASCADE,
+                        CONSTRAINT fk_driver_incompatibles_incompatibles FOREIGN KEY (incompatible_driver_id) REFERENCES drivers(id) ON DELETE CASCADE
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS rule_sets (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT,
+                        rules TEXT,
+                        should_hit_all NUMERIC
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS rule_set_driver_groups (
+                        rule_set_id INTEGER,
+                        driver_group_id INTEGER,
+                        PRIMARY KEY (rule_set_id, driver_group_id),
+                        CONSTRAINT fk_rule_set_driver_groups_rule_set FOREIGN KEY (rule_set_id) REFERENCES rule_sets(id) ON DELETE CASCADE,
+                        CONSTRAINT fk_rule_set_driver_groups_driver_group FOREIGN KEY (driver_group_id) REFERENCES driver_groups(id) ON DELETE CASCADE
                     )
                 ''')
                 
-                # Wipe any partial records to prevent key collision crashes
+                # 2. Pre-seed the migration ledger table so Go flags these steps as completed
+                cursor.execute("INSERT OR IGNORE INTO migrations (id) VALUES ('2026052601_baseline')")
+                cursor.execute("INSERT OR IGNORE INTO migrations (id) VALUES ('2026052901_m2m_and_uint_pks')")
+
+                # Clear legacy records to ensure a fresh clean slate migration path
                 cursor.execute("DELETE FROM driver_incompatibles;")
                 cursor.execute("DELETE FROM drivers;")
                 cursor.execute("DELETE FROM driver_groups;")
@@ -207,11 +235,10 @@ class Updater:
                 with open(json_path, 'r', encoding='utf-8') as f:
                     legacy_groups = json.load(f)
                     
-                # Dict tables to trace relationships across the new incremental integer spectrum
                 old_driver_to_new_int = {}
                 incompatible_linking_queue = []
 
-                # 2. Iterate and transform legacy structured JSON configurations
+                # 3. Extract and normalize structural properties
                 for pos, group in enumerate(legacy_groups):
                     g_name = group.get('name', '')
                     g_type = group.get('type', '')
@@ -229,7 +256,6 @@ class Updater:
                         d_type = driver.get('type', '')
                         d_path = driver.get('path', '')
                         
-                        # Pack array primitives into valid structural JSON strings for the Go parser
                         d_flags = json.dumps(driver.get('flags', []))
                         d_rt_codes = json.dumps(driver.get('allowRtCodes', []))
                         d_min_time = float(driver.get('minExeTime', 5))
@@ -242,13 +268,13 @@ class Updater:
                         )
                         new_driver_id = cursor.lastrowid
 
-                        # Map the old temporary string ID to the clean autoincremented SQLite ID
+                        # Map the temporary hex string ID to the clean autoincremented SQLite ID
                         old_driver_to_new_int[old_driver_id] = new_driver_id
                         
                         for inc_id in driver.get('incompatibles', []):
                             incompatible_linking_queue.append((new_driver_id, inc_id))
 
-                # 3. Resolve the dependency relationships using our temporary map
+                # 4. Bind driver cross-relational exclusions safely via our map
                 for current_id, target_old_id in incompatible_linking_queue:
                     mapped_target_id = old_driver_to_new_int.get(target_old_id)
                     if mapped_target_id:
@@ -260,7 +286,7 @@ class Updater:
                 conn.commit()
                 conn.close()
                 
-                # Turn groups.json into groups.json.bak so this migration runs exactly once
+                # Append .bak to ensure this migration sequence fires exactly once
                 json_path.rename(json_path.with_suffix('.json.bak'))
                 print('  ↳ Migration complete! groups.json cleanly converted into SQLite database fields.')
             except Exception as e:
