@@ -162,6 +162,16 @@ class Updater:
         db_path = conf_dir / 'data.db'
 
         if json_path.exists():
+            # GUARD CLAUSE: Prioritize the SQL database if both exist to prevent overwrites
+            if db_path.exists():
+                print('  ↳ Both groups.json and data.db found. Prioritizing existing SQLite database to prevent data loss.')
+                try:
+                    json_path.rename(json_path.with_suffix('.json.bak'))
+                    print('  ↳ Legacy groups.json cleanly retired to groups.json.bak.')
+                except Exception as e:
+                    print(f'  ⚠ Guard Warning: Failed to rename legacy JSON asset: {e}')
+                return
+
             print('  ↳ Found legacy groups.json. Migrating data to SQLite database layout...')
             try:
                 conn = sqlite3.connect(str(db_path))
@@ -316,7 +326,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     print(r'''
- _           _        _ _       _ _                        _       _            
+ _           _         _ _       _ _                         _       _            
 (_)_ __  ___| |_ __ _| | |     (_) |_      _   _ _ __   __| | __ _| |_ ___ _ __ 
 | | '_ \/ __| __/ _` | | |_____| | __|____| | | | '_ \ / _` |/ _` | __/ _ \ '__|
 | | | | \__ \ || (_| | | |_____| | ||_____| |_| | |_) | (_| | (_| | ||  __/ |   
